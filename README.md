@@ -1,214 +1,443 @@
 # apuntes-Github
 
-# Apuntes de Terraform – Evaluación 2
+# 📘 Apuntes Evaluación 2 – Infraestructura como Código I (Terraform)
 
-Resumen corto de: `count` / `for_each`, variables y outputs, módulos, `locals` + `random`, provisioners y debugging.
-
----
-
-## 0. Comandos básicos
-
-```bash
-terraform init          # descarga providers y módulos (siempre primero)
-terraform validate      # revisa la sintaxis
-terraform plan          # muestra qué va a cambiar
-terraform apply         # aplica los cambios
-terraform destroy       # elimina todo
-terraform output        # muestra los outputs
-terraform state list    # lista los recursos creados
-```
-
-En el plan: `+` crea · `-` destruye · `~` modifica · `-/+` recrea.
+> Temas: funciones repetitivas · variables y outputs · módulos · debugging · locals · remote-exec / local-exec
 
 ---
 
-## 1. `count` y `for_each`
+## 1. Comandos básicos
 
-Crean **varios recursos** con un solo bloque.
+| Comando | Para qué sirve |
+|---|---|
+| `terraform init` | Descarga providers y módulos, configura el backend |
+| `terraform validate` | Revisa la sintaxis |
+| `terraform plan` | Muestra qué va a cambiar (no aplica nada) |
+| `terraform apply` | Aplica los cambios (`-auto-approve` salta la confirmación) |
+| `terraform destroy` | Elimina todo lo que gestiona Terraform |
+| `terraform state list` | Lista los recursos del estado (con índices) |
+| `terraform output` | Muestra los outputs |
+| `terraform providers` / `terraform version` | Providers requeridos/instalados |
+| `terraform fmt` | Formatea el código |
+
+Símbolos del plan: `+` crear · `-` destruir · `-/+` destruir y recrear · `~` modificar.
+
+---
+
+## 2. Providers y bloque `terraform`
 
 ```hcl
-# count: recibe un número, se identifica por índice
-resource "aws_instance" "srv" {
-  count         = 3
-  ami           = var.ami
-  instance_type = "t2.micro"
-  tags          = { Name = "srv-${count.index}" }   # 0, 1, 2
+terraform {
+  required_version = ">= 1.0.0"
+  required_providers {
+    aws    = { source = "hashicorp/aws",    version = "~> 5.0" }
+    random = { source = "hashicorp/random", version = "3.1.0" }
+  }
 }
-# Acceso: aws_instance.srv[0].id   |   aws_instance.srv[*].id (todos)
 
-# for_each: recibe un map o set, se identifica por llave
-resource "aws_instance" "srv" {
-  for_each      = toset(["web", "api"])             # lista -> toset()
-  ami           = var.ami
-  instance_type = "t2.micro"
-  tags          = { Name = each.key }
+provider "aws" {
+  region = "us-east-1"
 }
-# Acceso: aws_instance.srv["web"].id
 ```
 
-| | `count` | `for_each` |
-|---|---|---|
-| Recibe | número | map o set |
-| Identifica por | índice `[0]` | llave `["web"]` |
-| Variables | `count.index` | `each.key` / `each.value` |
-| Si borras uno del medio | se corren los índices y se recrean recursos | solo se borra ese |
-
-No se pueden usar los dos en el mismo bloque.
+- Un **provider** es un plugin que habla con una API (AWS, Azure, GCP...).
+- Sin bloques `resource`, Terraform no crea nada.
 
 ---
 
-## 2. Variables y Outputs
+## 3. Resource, data, variables, locals, outputs
 
+### Resource → crea infraestructura
 ```hcl
-# variables.tf
-variable "region" {
-  type    = string
-  default = "us-east-1"      # sin default, Terraform lo pide
+resource "aws_vpc" "vpc" {          # resource "TIPO" "NOMBRE_LOCAL"
+  cidr_block = "10.0.0.0/16"
+  tags       = { Name = "demo" }
 }
-variable "subnets" {
-  type = list(string)
-}
+# Se referencia así: aws_vpc.vpc.id
+```
 
-# outputs.tf
+### Data source → consulta algo que YA existe
+```hcl
+data "aws_region" "current" {}
+data "aws_ami" "ubuntu" {
+  most_recent = true
+  owners      = ["099720109477"]
+  filter {
+    name   = "name"
+    values = ["ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-amd64-server-*"]
+  }
+}
+# Se referencia así: data.aws_ami.ubuntu.id
+```
+
+### Variables → entradas
+```hcl
+variable "vpc_cidr" {
+  type        = string
+  description = "CIDR de la VPC"
+  default     = "10.0.0.0/16"     # opcional (si no hay default, es obligatoria)
+}
+# Uso: var.vpc_cidr
+```
+Formas de pasar valores (de menor a mayor prioridad): `default` → variable de entorno `TF_VAR_x` → `terraform.tfvars` → `*.auto.tfvars` → `-var` / `-var-file` (la última gana).
+
+Tipos: `string`, `number`, `bool`, `list(string)`, `map(string)`, `set`, `object({...})`.
+
+### Locals → valores calculados internos (no se pasan desde afuera)
+```hcl
+locals {
+  application = "corp_api"
+  server_name = "ec2-${var.environment}-${local.application}"
+}
+# Uso: local.server_name   (OJO: es "local", sin "s", al usarlo)
+```
+
+### Outputs → datos que expone un módulo/proyecto
+```hcl
 output "vpc_id" {
   description = "ID de la VPC"
-  value       = aws_vpc.this.id
+  value       = aws_vpc.vpc.id
+  sensitive   = false
 }
 ```
+Ver con `terraform output` o `terraform output vpc_id`.
 
-Uso: `var.region` · `var.subnets[0]` · `terraform output vpc_id`
-
-Valores por fuera: `terraform.tfvars`, `-var="region=us-west-2"` o `-var-file="x.tfvars"`.
-
----
-
-## 3. Módulos
-
-Un módulo es **una carpeta con archivos `.tf`**. El módulo hijo solo recibe lo que el raíz le pasa y solo entrega lo que exporta con `output`.
-
-```
-proyecto/
-├── main.tf  variables.tf  outputs.tf     # raíz
-└── modulos/
-    └── ec2/
-        ├── main.tf  variables.tf  outputs.tf
-```
-
+### Provider `random`
 ```hcl
-# main.tf (raíz): llamar al módulo
-module "web" {
-  source    = "./modulos/ec2"              # ruta local
-  subnet_id = module.vpc.subnet_ids[0]     # output de otro módulo
-}
-
-# usar su output:  module.web.instance_id
-```
-
-Módulo del registry (acá sí va `version`):
-
-```hcl
-module "vpc" {
-  source  = "terraform-aws-modules/vpc/aws"
-  version = "~> 5.0"
-}
-```
-
-Después de agregar o cambiar un módulo → `terraform init`.
-
----
-
-## 4. Locals y Random
-
-```hcl
-resource "random_string" "suf" {
+resource "random_string" "suffix" {
   length  = 6
   special = false
   upper   = false
 }
-
-locals {
-  prefijo = "demo-${random_string.suf.result}"
-  tags    = { Proyecto = "evaluacion" }
-}
-
-# Uso: local.prefijo  (sin "s" al usarlo)
-resource "aws_vpc" "this" {
-  cidr_block = "10.0.0.0/16"
-  tags       = merge(local.tags, { Name = "${local.prefijo}-vpc" })
-}
+# Uso: random_string.suffix.result
 ```
-
-- `locals` = valores calculados **adentro** · `variable` = valores que **entran**.
-- `random_string` se guarda en el estado, no cambia en cada apply.
 
 ---
 
-## 5. Provisioners
+## 4. Funciones repetitivas: `count` vs `for_each`
 
-Corren cuando se **crea** el recurso.
+### `count` (lista indexada: `[0]`, `[1]`...)
+```hcl
+resource "local_sensitive_file" "users" {
+  count    = length(var.users)
+  filename = var.users[count.index]
+  content  = var.content
+}
+```
+
+### `for_each` (cada elemento tiene una **clave**)
+```hcl
+resource "local_sensitive_file" "users" {
+  for_each = toset(var.users)      # for_each NO acepta list: usar toset() o un map
+  filename = each.value
+  content  = var.content
+}
+```
+
+| | `count` | `for_each` |
+|---|---|---|
+| Acceso | `count.index` | `each.key` / `each.value` |
+| Entrada | número (o `length(lista)`) | `set` o `map` |
+| Dirección en el estado | `recurso.x[0]` | `recurso.x["clave"]` |
+| Si borras un elemento del medio | **se corren los índices → recrea recursos** | solo afecta a ese elemento ✅ |
+
+**Caso del laboratorio** (`users = ["./user10","./user11","./user12","./user10"]`):
+- Con `count`: crea **4** recursos (aunque `./user10` se repite).
+- Con `for_each` + `toset()`: crea **3** (el set elimina duplicados).
+- Si quitas `./user11` con `count`: los índices se desplazan → 1 destruido + 2 recreados (`-/+`). Con `for_each`: solo se destruye 1.
+
+> Regla: si los elementos pueden cambiar de orden o borrarse, usa **`for_each`**.
+
+---
+
+## 5. Provisioners: `local-exec` y `remote-exec`
 
 ```hcl
-resource "aws_instance" "web" {
-  ami           = var.ami
+resource "aws_instance" "web_server" {
+  ami           = data.aws_ami.ubuntu.id
   instance_type = "t2.micro"
-  key_name      = var.key_name
+  subnet_id     = aws_subnet.public.id
+  key_name      = aws_key_pair.generated.key_name
 
-  provisioner "local-exec" {                 # en MI computador
-    command = "echo ${self.public_ip} >> ips.txt"
-  }
-
-  connection {                               # solo para remote-exec
+  connection {                      # necesario para remote-exec
     type        = "ssh"
     user        = "ubuntu"
-    private_key = file("llave.pem")
+    private_key = tls_private_key.generated.private_key_pem
     host        = self.public_ip
   }
 
-  provisioner "remote-exec" {                # DENTRO del servidor
-    inline = ["sudo apt-get update -y", "sudo apt-get install -y nginx"]
+  provisioner "local-exec" {        # se ejecuta en TU máquina
+    command = "chmod 600 ${local_file.private_key_pem.filename}"
+  }
+
+  provisioner "remote-exec" {       # se ejecuta DENTRO del servidor (por SSH)
+    inline = [
+      "sudo apt-get update -y",
+      "sudo apt-get install -y nginx",
+    ]
+  }
+
+  lifecycle {
+    ignore_changes = [security_groups]
   }
 }
 ```
 
 | | `local-exec` | `remote-exec` |
 |---|---|---|
-| Dónde corre | mi máquina | el servidor |
-| `connection` | no | sí (SSH) |
+| Dónde corre | En la máquina donde ejecutas Terraform | En el recurso remoto |
+| Necesita `connection` | No | **Sí** (SSH/WinRM) |
+| Opciones | `command` | `inline`, `script`, `scripts` |
 
-Si un provisioner falla, el recurso queda **tainted** y se recrea en el próximo apply.
+- Los provisioners corren **solo al crear** el recurso (por defecto). Para volver a ejecutarlos hay que recrearlo.
+- Son el último recurso: Terraform no puede planificar lo que hacen.
+
+### Forzar recreación de un recurso
+```bash
+terraform taint aws_instance.web_server    # (antiguo) lo marca como "tainted"
+terraform apply -replace="aws_instance.web_server"   # (moderno, recomendado)
+terraform untaint aws_instance.web_server  # quita la marca
+```
+En el plan aparece: `is tainted, so must be replaced` → `Plan: 1 to add, 0 to change, 1 to destroy`.
 
 ---
 
-## 6. Debugging y Taint
+## 6. Debugging
 
 ```bash
-export TF_LOG=DEBUG                 # TRACE, DEBUG, INFO, WARN, ERROR
-export TF_LOG_PATH=./terraform.log  # guarda los logs en un archivo
-terraform plan
-cat terraform.log
-unset TF_LOG TF_LOG_PATH            # desactivar
+export TF_LOG=TRACE                      # niveles: TRACE, DEBUG, INFO, WARN, ERROR (TRACE = el más detallado)
+export TF_LOG_PATH="terraform_log.txt"   # guarda los logs en un archivo
+terraform init -upgrade                  # ejecuta algo y revisa el archivo
+export TF_LOG=""                         # desactiva el logging (también: unset TF_LOG)
+```
+En Windows PowerShell: `$env:TF_LOG="TRACE"` y `$env:TF_LOG_PATH="terraform_log.txt"`.
+
+Errores típicos:
+- `terraform validate` falla → error de sintaxis o argumento mal escrito (ej: `file` en vez de `filename`).
+- Falta `terraform init` al agregar un módulo/provider nuevo.
+- Referencia a un recurso/output que no existe (`module.vpc.subnet_ids` sin declarar el output).
+
+---
+
+## 7. Módulos
+
+- Un módulo = **cualquier carpeta con archivos `.tf`**. El directorio principal es el **módulo raíz**; los llamados son **módulos hijos**.
+- Estructura estándar mínima: `main.tf`, `variables.tf`, `outputs.tf`.
+- Un módulo hijo **no ve** las variables del raíz: todo lo que necesita se le pasa como argumento, y lo que devuelve sale por `output`.
+
+```hcl
+module "server" {                       # module "NOMBRE"
+  source    = "./modulos/ec2"           # ruta local o remota (registry)
+  ami       = data.aws_ami.ubuntu.id    # argumentos = variables del módulo hijo
+  subnet_id = module.vpc.subnet_ids[0]  # usar el output de otro módulo
+}
+# Usar un output del módulo: module.server.public_ip
 ```
 
-Se necesitan **las dos** variables para guardar el log en archivo.
+**Módulo del registry (con versión):**
+```hcl
+module "s3-bucket" {
+  source  = "terraform-aws-modules/s3-bucket/aws"
+  version = "~> 4.0"     # restricción de versión
+}
+```
+Restricciones: `= 1.2.3` exacta · `>= 1.2` mínima · `~> 1.2` permite 1.x · `~> 1.2.3` permite 1.2.x.
 
+Después de agregar un módulo → `terraform init`.
+
+Ventajas: reutilización, orden, consistencia entre entornos, más fácil de mantener y escalar.
+
+---
+
+## 8. Backend (estado)
+
+- **Local**: `terraform.tfstate` en tu equipo (sirve para pruebas).
+- **Remoto** (S3 + DynamoDB para bloqueo, GCS...): trabajo en equipo, respaldo y *state locking*.
+
+---
+
+## 9. Ejercicio de práctica: VPC + EC2 + NLB + S3 con módulos
+
+**Estructura**
+```
+.
+├── main.tf          # módulo raíz: locals + llamadas a módulos
+├── variables.tf
+├── outputs.tf
+├── terraform.tf     # providers (aws + random)
+└── modulos/
+    ├── vpc/  (main.tf, variables.tf, outputs.tf)
+    ├── ec2/  (main.tf, variables.tf, outputs.tf)
+    ├── nlb/  (main.tf, variables.tf, outputs.tf)
+    └── s3/   (main.tf, variables.tf, outputs.tf)
+```
+
+**Raíz – `main.tf`**
+```hcl
+resource "random_string" "suffix" {
+  length  = 6
+  special = false
+  upper   = false
+}
+
+locals {
+  prefix = "${var.project}-${random_string.suffix.result}"
+}
+
+module "vpc" {
+  source       = "./modulos/vpc"
+  prefix       = local.prefix
+  vpc_cidr     = var.vpc_cidr           # 10.0.0.0/16
+  subnet_cidrs = var.subnet_cidrs       # ["10.0.1.0/24", "10.0.2.0/24"]
+}
+
+module "ec2" {
+  source    = "./modulos/ec2"
+  for_each  = var.servers                # { web1 = 0, web2 = 1 }
+  name      = "${local.prefix}-${each.key}"
+  subnet_id = module.vpc.subnet_ids[each.value]
+}
+
+module "nlb" {
+  source    = "./modulos/nlb"
+  for_each  = var.nlbs                   # { nlb1 = 0, nlb2 = 1 }
+  name      = "${local.prefix}-${each.key}"
+  vpc_id    = module.vpc.vpc_id
+  subnet_id = module.vpc.subnet_ids[each.value]
+}
+
+module "s3" {
+  source      = "./modulos/s3"
+  for_each    = toset(var.buckets)       # ["data", "logs"]
+  bucket_name = "${local.prefix}-${each.key}"
+}
+```
+
+**Raíz – `variables.tf`**
+```hcl
+variable "project"      { type = string, default = "demo" }
+variable "vpc_cidr"     { type = string }
+variable "subnet_cidrs" { type = list(string) }
+variable "servers"      { type = map(number) }
+variable "nlbs"         { type = map(number) }
+variable "buckets"      { type = list(string) }
+```
+
+**Raíz – `outputs.tf`**
+```hcl
+output "vpc_id"      { value = module.vpc.vpc_id }
+output "ec2_ids"     { value = { for k, m in module.ec2 : k => m.instance_id } }
+output "nlb_dns"     { value = { for k, m in module.nlb : k => m.dns_name } }
+output "bucket_names"{ value = { for k, m in module.s3  : k => m.bucket_name } }
+```
+
+**`modulos/vpc/main.tf`**
+```hcl
+data "aws_availability_zones" "az" {}
+
+locals {
+  azs = data.aws_availability_zones.az.names
+}
+
+resource "aws_vpc" "this" {
+  cidr_block = var.vpc_cidr
+  tags       = { Name = "${var.prefix}-vpc" }
+}
+
+resource "aws_subnet" "this" {
+  count             = length(var.subnet_cidrs)
+  vpc_id            = aws_vpc.this.id
+  cidr_block        = var.subnet_cidrs[count.index]
+  availability_zone = local.azs[count.index]
+  tags              = { Name = "${var.prefix}-subnet-${count.index + 1}" }
+}
+```
+`variables.tf`: `prefix`, `vpc_cidr`, `subnet_cidrs` · `outputs.tf`: `vpc_id = aws_vpc.this.id`, `subnet_ids = aws_subnet.this[*].id`
+
+**`modulos/ec2/main.tf`**
+```hcl
+data "aws_ami" "ubuntu" {
+  most_recent = true
+  owners      = ["099720109477"]
+  filter {
+    name   = "name"
+    values = ["ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-amd64-server-*"]
+  }
+}
+
+locals {
+  tags = { Name = var.name, Environment = "Training" }
+}
+
+resource "aws_instance" "this" {
+  ami           = data.aws_ami.ubuntu.id
+  instance_type = var.instance_type
+  subnet_id     = var.subnet_id
+  tags          = local.tags
+}
+```
+`variables.tf`: `name`, `subnet_id`, `instance_type` (default `t2.micro`) · `outputs.tf`: `instance_id`
+
+**`modulos/nlb/main.tf`**
+```hcl
+locals {
+  lb_name = substr(replace(var.name, "_", "-"), 0, 32)   # el nombre del LB admite máx. 32 caracteres
+}
+
+resource "aws_lb" "this" {
+  name               = local.lb_name
+  load_balancer_type = "network"
+  internal           = true
+  subnets            = [var.subnet_id]
+}
+```
+`variables.tf`: `name`, `vpc_id`, `subnet_id` · `outputs.tf`: `dns_name = aws_lb.this.dns_name`
+
+**`modulos/s3/main.tf`**
+```hcl
+locals {
+  common_tags = { Terraform = "true" }
+}
+
+resource "aws_s3_bucket" "this" {
+  bucket = var.bucket_name
+  tags   = local.common_tags
+}
+
+resource "aws_s3_bucket_public_access_block" "this" {
+  bucket                  = aws_s3_bucket.this.id
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+```
+`variables.tf`: `bucket_name` · `outputs.tf`: `bucket_name = aws_s3_bucket.this.bucket`
+
+**`terraform.tfvars`**
+```hcl
+vpc_cidr     = "10.0.0.0/16"
+subnet_cidrs = ["10.0.1.0/24", "10.0.2.0/24"]
+servers      = { web1 = 0, web2 = 1 }
+nlbs         = { nlb1 = 0, nlb2 = 1 }
+buckets      = ["data", "logs"]
+```
+
+**Mostrar debugging (lo piden en el ejercicio)**
 ```bash
-terraform taint aws_instance.web                 # marca para recrear
-terraform apply -replace="aws_instance.web"      # forma moderna (taint está deprecado)
-terraform untaint aws_instance.web               # quitar la marca
+export TF_LOG=DEBUG
+export TF_LOG_PATH="terraform_log.txt"
+terraform init && terraform plan
+export TF_LOG=""
 ```
 
 ---
 
-## 7. Errores comunes
+## 10. Mini-resumen para el día de la prueba
 
-| Error | Solución |
-|---|---|
-| Falta `terraform init` tras agregar módulo o provider | Ejecutar `terraform init` |
-| `for_each` con una lista | `toset(var.lista)` |
-| `aws_instance.srv.id` con `count` | `aws_instance.srv[0].id` |
-| `random_string.suf` sin `.result` | `random_string.suf.result` |
-| Usar un recurso interno de un módulo | El módulo debe exportarlo con `output` |
-| `version` en un módulo local | `version` es solo para módulos del registry |
-| `host = aws_instance.x.public_ip` dentro de su `connection` | `self.public_ip` |
-
-Para subir a GitHub **no incluyas**: `*.tfstate`, `.terraform/` ni credenciales/llaves `.pem`.
+- **Recurso** = crea · **data** = consulta · **variable** = entra · **local** = se calcula adentro · **output** = sale.
+- `count` → índices · `for_each` → claves (necesita `set`/`map`).
+- `local-exec` = en mi PC · `remote-exec` = en el servidor (necesita `connection`).
+- `TF_LOG` activa logs · `TF_LOG_PATH` los guarda · `TF_LOG=""` los apaga.
+- Módulo = carpeta con `.tf` · se llama con `module` + `source` · sus outputs se leen con `module.NOMBRE.OUTPUT`.
+- Siempre `terraform init` tras agregar módulos o providers.
